@@ -1,14 +1,39 @@
+import os
 import re
+import time
+import socket
+import logging
 import base64
+from typing import Optional, Dict, Any
+from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
-from typing import Optional, Dict, Any
 
-BASE_URL = "https://exams.mlrinstitutions.ac.in"
+logger = logging.getLogger("mlrit_scraper")
+
+BASE_URL = os.getenv("PORTAL_BASE_URL", "https://exams.mlrinstitutions.ac.in").rstrip("/")
+PORTAL_PROXY = os.getenv("PORTAL_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
+PORTAL_TIMEOUT = float(os.getenv("PORTAL_TIMEOUT", "15.0"))
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
+
+
+def get_async_client(timeout_sec: Optional[float] = None) -> httpx.AsyncClient:
+    """Create a configured httpx.AsyncClient with proxy and timeout support."""
+    effective_timeout = timeout_sec if timeout_sec is not None else PORTAL_TIMEOUT
+    client_kwargs = {
+        "follow_redirects": True,
+        "timeout": effective_timeout,
+        "verify": False,
+        "http2": False,
+    }
+    if PORTAL_PROXY:
+        client_kwargs["proxy"] = PORTAL_PROXY
+    return httpx.AsyncClient(**client_kwargs)
+
 
 def _extract_aspnet_tokens(html: str) -> Dict[str, str]:
     """Extract __VIEWSTATE, __VIEWSTATEGENERATOR, __EVENTVALIDATION tokens."""
@@ -21,11 +46,60 @@ def _extract_aspnet_tokens(html: str) -> Dict[str, str]:
     return tokens
 
 
+async def check_portal_connectivity(timeout_sec: float = 6.0) -> Dict[str, Any]:
+    """Test DNS resolution, latency, and HTTP reachability to the MLRIT portal."""
+    parsed = urlparse(BASE_URL)
+    host = parsed.hostname or "exams.mlrinstitutions.ac.in"
+    result: Dict[str, Any] = {
+        "portal_url": BASE_URL,
+        "portal_host": host,
+        "proxy_configured": bool(PORTAL_PROXY),
+        "proxy": PORTAL_PROXY if PORTAL_PROXY else None,
+        "dns_resolved": False,
+        "portal_ip": None,
+        "http_reachable": False,
+        "http_status": None,
+        "latency_ms": None,
+        "error": None,
+    }
+
+    t0 = time.time()
+    try:
+        result["portal_ip"] = socket.gethostbyname(host)
+        result["dns_resolved"] = True
+    except Exception as e:
+        result["error"] = f"DNS resolution failed for {host}: {str(e)}"
+        return result
+
+    try:
+        async with get_async_client(timeout_sec=timeout_sec) as client:
+            headers = {
+                "User-Agent": DEFAULT_USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            res = await client.get(f"{BASE_URL}/", headers=headers)
+            result["http_status"] = res.status_code
+            result["http_reachable"] = (res.status_code == 200)
+            result["latency_ms"] = round((time.time() - t0) * 1000, 2)
+    except httpx.TimeoutException:
+        result["error"] = (
+            "Connection timed out. The MLRIT Portal firewall is blocking/dropping requests from this server's IP. "
+            "Because MLRIT is hosted on an Indian on-premise network, cloud servers outside India need an Indian proxy "
+            "(set PORTAL_PROXY env var) or to be hosted within India."
+        )
+    except httpx.ConnectError as e:
+        result["error"] = f"Connection refused or dropped by firewall: {str(e)}"
+    except Exception as e:
+        result["error"] = f"Connection check failed: {type(e).__name__} ({str(e)})"
+
+    return result
+
+
 async def fetch_student_details(
     roll_no: str,
     password: Optional[str] = None,
     include_photo_base64: bool = False,
-    timeout_sec: float = 20.0
+    timeout_sec: Optional[float] = None
 ) -> Dict[str, Any]:
     """
     Asynchronously scrape student basic information from MLRIT portal.
@@ -42,20 +116,15 @@ async def fetch_student_details(
         "Accept-Language": "en-US,en;q=0.9",
     }
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        timeout=timeout_sec,
-        verify=False,
-        http2=False
-    ) as client:
+    async with get_async_client(timeout_sec=timeout_sec) as client:
         # Step 1: GET Home page to retrieve initial ASP.NET tokens & session cookie
         res_home = await client.get(f"{BASE_URL}/", headers=headers)
         if res_home.status_code != 200:
-            raise RuntimeError(f"MLRIT portal is unreachable. Status: {res_home.status_code}")
+            raise RuntimeError(f"MLRIT portal returned status {res_home.status_code} on home page.")
 
         tokens_home = _extract_aspnet_tokens(res_home.text)
         if not tokens_home.get("__VIEWSTATE"):
-            raise RuntimeError("Failed to extract initial ASP.NET session tokens.")
+            raise RuntimeError("Failed to extract initial ASP.NET session tokens from home page.")
 
         # Step 2: Post back 'lnkStudent' to reveal student login inputs
         post_lnk_student = {
@@ -140,7 +209,8 @@ async def fetch_student_details(
                     content_type = res_photo.headers.get("content-type", "image/jpeg")
                     encoded = base64.b64encode(res_photo.content).decode("utf-8")
                     photo_base64 = f"data:{content_type};base64,{encoded}"
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to fetch photo base64: {e}")
                 photo_base64 = None
 
         return {
@@ -167,7 +237,7 @@ async def fetch_student_details(
 async def fetch_student_photo_bytes(
     roll_no: str,
     password: Optional[str] = None,
-    timeout_sec: float = 20.0
+    timeout_sec: Optional[float] = None
 ) -> bytes:
     """Fetch raw photo bytes for streaming."""
     clean_roll = roll_no.strip().upper()
@@ -179,7 +249,7 @@ async def fetch_student_photo_bytes(
         "Referer": f"{BASE_URL}/",
     }
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_sec, verify=False) as client:
+    async with get_async_client(timeout_sec=timeout_sec) as client:
         res_home = await client.get(f"{BASE_URL}/", headers=headers)
         tokens_home = _extract_aspnet_tokens(res_home.text)
 
