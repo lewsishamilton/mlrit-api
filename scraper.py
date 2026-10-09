@@ -55,6 +55,7 @@ async def check_portal_connectivity(timeout_sec: float = 6.0) -> Dict[str, Any]:
         "portal_host": host,
         "proxy_configured": bool(PORTAL_PROXY),
         "proxy": PORTAL_PROXY if PORTAL_PROXY else None,
+        "server_outbound_ip": None,
         "dns_resolved": False,
         "portal_ip": None,
         "http_reachable": False,
@@ -62,6 +63,15 @@ async def check_portal_connectivity(timeout_sec: float = 6.0) -> Dict[str, Any]:
         "latency_ms": None,
         "error": None,
     }
+
+    # Fetch server's public outbound IP
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as ip_client:
+            r_ip = await ip_client.get("https://api.ipify.org?format=json")
+            if r_ip.status_code == 200:
+                result["server_outbound_ip"] = r_ip.json().get("ip")
+    except Exception:
+        pass
 
     t0 = time.time()
     try:
